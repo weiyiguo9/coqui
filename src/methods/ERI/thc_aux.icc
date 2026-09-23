@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <random>
 
 #include "configuration.hpp"
@@ -1840,7 +1841,6 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
   {
     tot_nI_in_node = Z_qug.local_range(1).size();
     mpi->node_comm.all_reduce_in_place_n(&tot_nI_in_node,1,std::plus<>{});
-    utils::check(tot_nI_in_node>0, "Error: tot_nI_in_node == 0");
     max_nI_in_node = tot_nI_in_node;
     mpi->comm.all_reduce_in_place_n(&max_nI_in_node,1,mpi3::max<>{});
   }
@@ -1936,10 +1936,11 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
     ipt(mpi->node_comm.rank(),1) = Z_qug.local_range(1).size();    // number of ipts 
     mpi->node_comm.all_reduce_in_place_n(ipt.data(),ipt.size(),std::plus<>{});
     // round robin over all cores to improve compute balance during iterations
-    int icnt = 0; 
+    int icnt = 0;
     long ic = 0;
     for( long ib=0; ib<nblk; ++ib ) {
-      for( long iu=0; iu<nI_per_node; ++iu ) {
+      long nI = tot_nI_in_node/nblk + (ib < tot_nI_in_node%nblk);
+      for( long iu=0; iu<nI; ++iu ) {
 
         // look for next available ipt (is there a scenario when this runs indefinitely???)
         while(ipt(ic,1) == 0) { ic = (ic+1)%ncores; } 
@@ -1950,11 +1951,7 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
         ic = (ic+1)%ncores; 
         icnt++;
  
-        if(icnt == tot_nI_in_node)
-          break;
       } 
-      if(icnt == tot_nI_in_node)
-        break;
     }
     if(mpi->node_comm.root())
       mpi->internode_comm.all_reduce_in_place_n(iu_for_sXb.data(),iu_for_sXb.size(),std::plus<>{});
@@ -2056,6 +2053,13 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
   }
   Timer.stop("EXTRA");
 
+  // FFT plans are local to each rank and reused across blocks and spin components.
+  // Both plans must be made before either input buffer contains live block data:
+  // FFT_MEASURE can overwrite the arrays passed to its planner.
+  // Include the first local transform: its offset changes FFTW's SIMD alignment
+  // class when the real-space grid volume is odd.
+  std::map<std::pair<long,long>,math::nda::fft<true>> backward_fft_plans, forward_fft_plans;
+
   // calculate T(u,r) for all kpoints and orbital ranges 
   for( auto isp : nda::range(nspins*npol) ) 
   {
@@ -2066,8 +2070,7 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
     for( auto ib : nda::range(nblk) ) { 
 
       // Ipts in this iteration
-      int b0 = ib*nI_per_node;
-      int nI = std::min(int(nI_per_node), tot_nI_in_node-b0);
+      long nI = tot_nI_in_node/nblk + (ib < tot_nI_in_node%nblk);
 
       auto Tkur = memory::array_view<MEM,ComplexType,2>({nkloc, nI*rho_g.nnr()},Tkur_1d.data()); 
       auto TRur = memory::array_view<MEM,ComplexType,2>({nkpts, nI*rho_g.nnr()},TRur_1d.data()); 
@@ -2085,9 +2088,19 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
       auto T4d_out = arr_v({kI_rng.size(),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)},
                            TRur_1d.data() + kI0*rho_g.nnr());
 
+      auto [qI0,qI1] = itertools::chunk_range(0,nqpts_ibz*nI,mpi->node_comm.size(),mpi->node_comm.rank());
+      auto Z4d_in = arr_v({qI1-qI0,rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)},
+                          Zqur.data()+qI0*rho_g.nnr());
+      auto Z4d_out = arr_v({qI1-qI0,rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)},
+                           TRur_1d.data()+qI0*rho_g.nnr());
+
       Timer.start("FFTPLAN");
-      math::nda::fft<true> F(T4d_in,T4d_out,
-                             math::fft::FFT_MEASURE|math::fft::FFT_DESTROY_INPUT);
+      if(kI_rng.size()>0)
+        backward_fft_plans.try_emplace(std::pair{kI_rng.size(),kI0},T4d_in,T4d_out,
+                              math::fft::FFT_MEASURE|math::fft::FFT_DESTROY_INPUT);
+      if(qI1>qI0)
+        forward_fft_plans.try_emplace(std::pair{qI1-qI0,qI0},Z4d_in,Z4d_out,
+                              math::fft::FFT_MEASURE|math::fft::FFT_DESTROY_INPUT);
       Timer.stop("FFTPLAN");
 
       {
@@ -2123,7 +2136,8 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
           Timer.stop("EXTRA");
           Timer.start("FFT");
           // G -> r
-          F.backward(T4d_in,T4d_out);
+          if(kI_rng.size()>0)
+            backward_fft_plans.at({kI_rng.size(),kI0}).backward(T4d_in,T4d_out);
           Timer.stop("FFT");
           T4d_in() = T4d_out();
  
@@ -2222,7 +2236,8 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
           Timer.stop("EXTRA");
           Timer.start("FFT");
           // G -> r
-          F.backward(T4d_in,T4d_out);
+          if(kI_rng.size()>0)
+            backward_fft_plans.at({kI_rng.size(),kI0}).backward(T4d_in,T4d_out);
           Timer.stop("FFT");
           T4d_in() = T4d_out();
 
@@ -2279,7 +2294,7 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
       mpi->node_comm.barrier();
 
       // update kI to new range: {0,nqpts_ibz*nI}
-      std::tie(kI0,kI1) = itertools::chunk_range(0,nqpts_ibz*nI,mpi->node_comm.size(),mpi->node_comm.rank()); 
+      std::tie(kI0,kI1) = std::tie(qI0,qI1);
       kI_rng = nda::range(kI0,kI1);
 
       // 4d. C(q,u,v) = Z(q,u,rv)
@@ -2313,19 +2328,9 @@ auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& 
       // 4f. Z(q,u,G) = fft(Z(q,u,r)) => mapped to truncated G grid
       // fft r->G
       { 
-        auto Z2D = memory::array_view<MEM,ComplexType,2>({kI_rng.size(),rho_g.nnr()},
-                                                          Zqur.data()+kI0*rho_g.nnr()); 
-        auto Z4d_in = nda::reshape(Z2D,
-           std::array<long,4>{kI_rng.size(),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
-        auto Z4d_out = memory::array_view<MEM,ComplexType,4>({kI_rng.size(),
-           rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)},TRur_1d.data()+kI0*rho_g.nnr());
-
-        Timer.start("FFTPLAN");
-        math::nda::fft<true> F2(Z4d_in,Z4d_out,
-                             math::fft::FFT_MEASURE|math::fft::FFT_DESTROY_INPUT);
-        Timer.stop("FFTPLAN");
         Timer.start("FFT");
-        F2.forward(Z4d_in,Z4d_out);
+        if(kI_rng.size()>0)
+          forward_fft_plans.at({kI_rng.size(),kI0}).forward(Z4d_in,Z4d_out);
         Timer.stop("FFT");
         mpi->node_comm.barrier();
 
