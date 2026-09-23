@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "nda/h5.hpp"
 #include "numerics/distributed_array/nda.hpp"
+#include "numerics/fft/k_grid.hpp"
 #include "numerics/shared_array/nda.hpp"
 
 #include "utilities/mpi_context.h"
@@ -78,13 +80,10 @@ namespace solvers {
             std::chrono::duration<double>(progress_clock::now() - setup_start).count());
     app_log_flush();
 
-    // prepare Fourier transform matrices between k-space and R-space
+    // Prepare the irreducible-q transform.
     setup_start = progress_clock::now();
     app_log(2, "    - [P] setup Fourier coefficient matrices: started");
     app_log_flush();
-    math::shm::shared_array<nda::array_view<ComplexType,2>> sf_Rk(*mpi, {nkpts,nkpts});
-    utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), MF->kpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
-    auto f_Rk = sf_Rk.local();
     math::shm::shared_array<nda::array_view<ComplexType,2>> sf_qR(*mpi,{nqpts_ibz,nkpts});
     utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), MF->Qpts_ibz(), MF->lattv(), MF->kp_grid(), sf_qR);
     auto f_qR = sf_qR.local();
@@ -106,7 +105,25 @@ namespace solvers {
         t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts, Np, Np}, {1, 1, 1, 1});
     auto dbuf_skPQ  = make_distributed_array<local_Array_4D_t>(
         t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts_no_trev, Np, Np}, {1, 1, 1, 1});
-    nda::matrix<ComplexType> X_R_PQ(nkpts, NP_loc*NQ_loc);
+    math::fft::k_grid_forward k_to_R(MF->kpts(), MF->lattv(), MF->kp_grid(),
+                                   nkpts != 1 ? NP_loc*NQ_loc : 0);
+    int use_k_fft = k_to_R.can_fft() ? 1 : 0;
+    mpi->comm.all_reduce_in_place_n(&use_k_fft, 1, mpi3::min<>{});
+    using shared_matrix_t = math::shm::shared_array<nda::array_view<ComplexType, 2>>;
+    std::optional<shared_matrix_t> sf_Rk;
+    nda::matrix<ComplexType> X_R_PQ;
+    if (nkpts != 1 && !use_k_fft) {
+      if (mpi->comm.root())
+        app_warning("RPA k -> R FFT is unsuitable for this k-point mesh; using GEMM with original k-points.");
+      sf_Rk.emplace(*mpi, std::array<long, 2>{long(nkpts), long(nkpts)});
+      utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), MF->kpts(),
+                                 MF->lattv(), MF->kp_grid(), *sf_Rk);
+      if (NP_loc * NQ_loc > 0)
+        X_R_PQ.resize(shape_t<2>{nkpts, NP_loc * NQ_loc});
+    }
+    char const *Gp_k_to_R_stage = use_k_fft ? "G(+tau) k -> R FFT" : "G(+tau) k -> R GEMM";
+    char const *Gn_k_to_R_stage = use_k_fft ? "G(-tau) k -> R FFT" : "G(-tau) k -> R GEMM";
+    char const *k_to_R_method = use_k_fft ? "FFT" : "GEMM";
     utils::check(dGp_sRPQ.local_shape()[2] == NP_loc, "dGp_sRPQ.local_shape[2] != NP_loc");
     utils::check(dGp_sRPQ.local_shape()[3] == NQ_loc, "dGp_sRPQ.local_shape[3] != NQ_loc");
     _Timer.stop("PI_ALLOC_R");
@@ -163,16 +180,20 @@ namespace solvers {
       }
       finish_stage(it, "G(+tau) symmetry unfold/copy", stage_start, unfold_seconds);
       if (nkpts!=1) {
-        stage_start = begin_stage(it, "G(+tau) k -> R GEMM");
+        stage_start = begin_stage(it, Gp_k_to_R_stage);
         _Timer.start("PI_FT_R");
         for (size_t is=0; is<ns; ++is) {
           auto GpR_2D = nda::reshape(Gp_sRPQ_loc(is, nda::ellipsis{}),
                                      shape_t<2>{nkpts, NP_loc * NQ_loc});
-          nda::blas::gemm(f_Rk, GpR_2D, X_R_PQ);
-          GpR_2D = X_R_PQ;
+          if (use_k_fft) {
+            k_to_R.transform(GpR_2D);
+          } else if (NP_loc * NQ_loc > 0) {
+            nda::blas::gemm(sf_Rk->local(), GpR_2D, X_R_PQ);
+            GpR_2D = X_R_PQ;
+          }
         }
         _Timer.stop("PI_FT_R");
-        finish_stage(it, "G(+tau) k -> R GEMM", stage_start, k_to_R_seconds);
+        finish_stage(it, Gp_k_to_R_stage, stage_start, k_to_R_seconds);
       }
 
       // setup Gn
@@ -193,16 +214,20 @@ namespace solvers {
       }
       finish_stage(it, "G(-tau) symmetry unfold/copy", stage_start, unfold_seconds);
       if (nkpts!=1) {
-        stage_start = begin_stage(it, "G(-tau) k -> R GEMM");
+        stage_start = begin_stage(it, Gn_k_to_R_stage);
         _Timer.start("PI_FT_R");
         for (size_t is=0; is<ns; ++is) {
           auto GnR_2D = nda::reshape(Gn_sRPQ_loc(is, nda::ellipsis{}),
                                      shape_t<2>{nkpts, NP_loc * NQ_loc});
-          nda::blas::gemm(f_Rk, GnR_2D, X_R_PQ);
-          GnR_2D = X_R_PQ;
+          if (use_k_fft) {
+            k_to_R.transform(GnR_2D);
+          } else if (NP_loc * NQ_loc > 0) {
+            nda::blas::gemm(sf_Rk->local(), GnR_2D, X_R_PQ);
+            GnR_2D = X_R_PQ;
+          }
         }
         _Timer.stop("PI_FT_R");
-        finish_stage(it, "G(-tau) k -> R GEMM", stage_start, k_to_R_seconds);
+        finish_stage(it, Gn_k_to_R_stage, stage_start, k_to_R_seconds);
       }
 
       // Hadamard product
@@ -246,9 +271,9 @@ namespace solvers {
       }
     } // it
     app_log(2, "    - [P] root shard stage totals: primary -> auxiliary {:.1f} s; "
-               "symmetry unfold/copy {:.1f} s; k -> R GEMM {:.1f} s; "
+               "symmetry unfold/copy {:.1f} s; k -> R {} {:.1f} s; "
                "Hadamard {:.1f} s; R -> irreducible-q GEMM {:.1f} s",
-            prim_to_aux_seconds, unfold_seconds, k_to_R_seconds,
+            prim_to_aux_seconds, unfold_seconds, k_to_R_method, k_to_R_seconds,
             hadamard_seconds, R_to_q_seconds);
     app_log(2, "    - [P] root shard compute complete; entering final synchronization");
     app_log_flush();

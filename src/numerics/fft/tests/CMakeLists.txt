@@ -5,6 +5,7 @@ set(TEST_ID math_fft_nda)
 
 set( TEST_SRCS 
      test_fft_nda.cpp
+     test_k_grid.cpp
    )
 
 if(USE_DEVICE_COMPILER)

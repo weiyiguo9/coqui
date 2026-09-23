@@ -22,6 +22,8 @@
 #ifndef COQUI_G0_DIV_UTILS_HPP
 #define COQUI_G0_DIV_UTILS_HPP
 
+#include <set>
+
 #include "mpi3/communicator.hpp"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
