@@ -710,22 +710,18 @@ auto partition_irreducible_r_grid(utils::Communicator auto& comm,
                   "Error: Found unassigned points in partition_irreducible_r_grid");
     long ns = r_set.size();
     app_log(3," Size of IR fft-rgrid: {}", ns); 
-    utils::check(ns >= comm.size(), "Error: More processors than IR r-grid groups:{}.",ns);
-
-    // now distribute over processors
+    // Keep symmetry orbits intact and balance their actual grid-point counts.
+    // Ranks beyond the number of orbits receive an empty partition.
     std::vector<std::vector<long>> r_p(nproc);
-    long av_sz = nnr/comm.size();
     auto idx = nda::arange(0,ns);
     std::sort(idx.begin(),idx.end(),
-       [&] (auto const& a, auto const&b) {return r_set[a].size() > r_set[b].size();});
+       [&] (auto const& a, auto const&b) {
+         return r_set[a].size() == r_set[b].size() ? a < b : r_set[a].size() > r_set[b].size();
+       });
 
     for( auto i : idx ) { 
-      // if it fits, dump. Otherwise dump in smallest stack
-      auto it = std::find_if( r_p.begin(), r_p.end(), 
-              [&] (auto const& v) { return v.size()+r_set[i].size() <= av_sz; }); 
-      if( it == r_p.end() ) 
-        it = std::min_element( r_p.begin(), r_p.end(),    
-              [&] (auto const& a, auto const& b) { return a.size() < b.size(); }); 
+      auto it = std::min_element( r_p.begin(), r_p.end(),
+              [&] (auto const& a, auto const& b) { return a.size() < b.size(); });
       it->reserve(it->size()+r_set[i].size());
       for( auto v : r_set[i] )
         it->emplace_back(v);        
