@@ -207,7 +207,8 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
   auto rn = nda::array<long,1>::zeros({nmax});
   // iteratively constructed cholesky vectors
   auto R = local_CArray_t::zeros({nmax,r_range.size()});
-  utils::check( block_size <= r_range.size(), "Error: block_size:{} > r_range:{}",block_size,r_range.size());
+  utils::check( block_size <= rho_g.nnr(), "Error: block_size:{} > r-grid:{}",block_size,rho_g.nnr());
+  long local_block_size = std::min<long>(block_size,r_range.size());
   
   // 4D views into local sector of Psi
   auto Psia = nda::reshape(distPsia.local(),shape_t<4>{nspins,nkpts_ibz,a_range.size(),r_range.size()});
@@ -217,9 +218,10 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
   *********************************************/
 
   // list of largest block_size residuals and (local) indexes
-  nda::array<RealType,1> lmax_res_val(block_size,0.0);
+  // Missing local candidates must never win a distributed pivot selection.
+  nda::array<RealType,1> lmax_res_val(block_size,-std::numeric_limits<RealType>::infinity());
   // linear indexes of the locations of the maximum residuals (not in order)
-  nda::array<long, 1> lmax_res_indx(block_size,0);
+  nda::array<long, 1> lmax_res_indx(block_size,-1);
   nda::array<std::pair<RealType,int>,1> gmax_res(block_size);
 
   memory::array<MEM,ComplexType,1> Diag(r_range.size(),0.0);
@@ -241,7 +243,7 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
         }
       }
     }
-  } else {
+  } else if (r_range.size() > 0) {
     // is it worth using all this memory to speed up the contraction???
     // consider batching over kpoints
     memory::device_array<ComplexType,3> Lr(nspins,nkpts_ibz,r_range.size());
@@ -264,8 +266,9 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
     }
   }
   // find index and value of maximum element  
-  utils::max_element_multi(Diag,lmax_res_val(nda::range(0,block_size)),
-                           lmax_res_indx(nda::range(0,block_size)));
+  if (local_block_size > 0)
+    utils::max_element_multi(Diag,lmax_res_val(nda::range(0,local_block_size)),
+                             lmax_res_indx(nda::range(0,local_block_size)));
   Timer.start("COMM");
   utils::find_distributed_maximum(mpi->comm,lmax_res_val(nda::range(0,block_size)),gmax_res);
   Timer.stop("COMM");
@@ -394,6 +397,7 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
     // 			      [ sum_i conj(Psia(is,k,i,r)) * Psia(is,k,i,u(n)) ] 
     Timer.start("ip_chol");
     Tab() = ComplexType(0.0);
+    if (r_range.size() > 0) {
     if constexpr (MEM==HOST_MEMORY) {
       // MAM: could dispatch with batched gemm, but nda implementation is not ideal, 
       //      e.g. how to transpose the A/B matrices meaningfully?
@@ -457,6 +461,7 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
     if(nchol > 0) {
       nda::blas::gemm(ComplexType(-1.0),nda::dagger(Rc(nda::range(0,nchol),all)),
                       R(nda::range(0,nchol),all),ComplexType(1.0),Tab);
+    }
     }
 
     // form block matrix
@@ -569,8 +574,9 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
       if(i != piv(i))
         Tab(i,all) = Tab(piv(i),all);
     }
-    nda::blas::gemm(Abb(nda::range(0,newv),nda::range(0,newv)),
-                    Tab(nda::range(0,newv),all), Rn);
+    if (r_range.size() > 0)
+      nda::blas::gemm(Abb(nda::range(0,newv),nda::range(0,newv)),
+                      Tab(nda::range(0,newv),all), Rn);
     
     // reduce at the end, no need to know this during iterations...
     for(int n=0; n<newv; ++n)
@@ -588,14 +594,15 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
       for( auto v : itertools::range(newv) )
         for( auto r : itertools::range(r_range.size()) )
           Diag(r) -= std::conj(Rn(v,r)) * Rn(v,r);
-    } else {
+    } else if (r_range.size() > 0) {
       nda::tensor::contract(ComplexType(-1.0), nda::conj(Rn), "vr", Rn, "vr", ComplexType(1.0), Diag,"r");
     }
     Timer.stop("ip_update_res");
 
     // find index and value of maximum element  
-    utils::max_element_multi(Diag,lmax_res_val(nda::range(0,block_size)),
-                             lmax_res_indx(nda::range(0,block_size)));
+    if (local_block_size > 0)
+      utils::max_element_multi(Diag,lmax_res_val(nda::range(0,local_block_size)),
+                               lmax_res_indx(nda::range(0,local_block_size)));
     Timer.start("ip_COMM");
     utils::find_distributed_maximum(mpi->comm,lmax_res_val(nda::range(0,block_size)),gmax_res);
     Timer.stop("ip_COMM");
